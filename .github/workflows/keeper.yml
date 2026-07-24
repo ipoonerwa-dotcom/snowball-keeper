@@ -1,0 +1,53 @@
+name: snowball-poke
+
+# 每天把 Snowball 签约的当日奖励按 5 分钟 TWAP 结算入账(refreshBaseline → 等 ~6min → poke)。
+# 调用全部 permissionless,热钱包只付 gas、无任何角色。
+#
+# 一次性设置:
+#   1) 生成一个全新钱包(不要用 owner/部署/guardian 私钥),充一点点 BNB 付 gas。
+#   2) 仓库 Settings → Secrets and variables → Actions → New repository secret:
+#        KEEPER_PK        = 该新钱包私钥(0x…)
+#   3) 同页 Variables(或 Secrets)加:
+#        SNOWBALL_STAKING = 签约合约地址(合约部署后填;预言机地址脚本会自动读)
+#      可选 Variables:RPC_URL、WINDOW_WAIT_MS
+#   4) 推这个仓库。之后按下面的时间自动跑;也可在 Actions 页手动 Run workflow。
+#
+# 提示:用「公开仓库」→ GitHub Actions 分钟数免费/不限量(私有仓库每月上限 2000 分钟)。
+
+on:
+  schedule:
+    # 北京时间(UTC+8)约 00:00 结算当天;多排几次做冗余——GitHub 定时是尽力而为、可能跳过或延迟。
+    # 首个成功 poke 后,20 小时冷却会让同日后续几次自动早退(便宜的空跑)。
+    - cron: "0 16 * * *"    # 16:00 UTC = 次日 00:00 北京
+    - cron: "20 16 * * *"   # 00:20 北京(备份)
+    - cron: "0 17 * * *"    # 01:00 北京(再备份)
+  workflow_dispatch: {}
+
+concurrency:
+  group: snowball-poke
+  cancel-in-progress: false   # 绝不并发两轮(避免 nonce 冲突)
+
+jobs:
+  poke:
+    runs-on: ubuntu-latest
+    # 脚本里要 sleep ~6 分钟等 TWAP 窗口;15 分钟硬上限只做余量(含 npm install)。
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install deps
+        run: npm install --no-audit --no-fund
+      - name: Daily double-poke
+        env:
+          KEEPER_PK: ${{ secrets.KEEPER_PK }}
+          SNOWBALL_STAKING: ${{ vars.SNOWBALL_STAKING || secrets.SNOWBALL_STAKING }}
+          RPC_URL: ${{ vars.RPC_URL || 'https://bsc-rpc.publicnode.com' }}
+          WINDOW_WAIT_MS: ${{ vars.WINDOW_WAIT_MS || '' }}
+        run: |
+          if [ -z "$KEEPER_PK" ]; then
+            echo "::warning::KEEPER_PK 未设 —— 跳过。到仓库 Settings → Secrets 添加后启用。"
+            exit 0
+          fi
+          node snowball-poke.mjs

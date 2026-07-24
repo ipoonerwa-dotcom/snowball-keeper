@@ -1,0 +1,13 @@
+{
+  "name": "snowball-keeper",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Snowball 签约 keeper —— 每日双 poke 结算金本位奖励(permissionless,热钱包只付 gas)。",
+  "scripts": {
+    "poke": "node snowball-poke.mjs"
+  },
+  "dependencies": {
+    "ethers": "^6.13.4"
+  }
+}
