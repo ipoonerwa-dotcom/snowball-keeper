@@ -37,6 +37,8 @@ const ROUTER_ABI = [
   "function rank(address) view returns (uint8)",
   "function teamUsd(address) view returns (uint256)",
   "function rankUpdater() view returns (address)",
+  "function referralPool() view returns (uint256)",
+  "function totalOwed() view returns (uint256)",
   "function setStats(address[] users, uint8[] ranks, uint256[] teamUsds)",
 ];
 
@@ -70,6 +72,13 @@ async function main() {
     return;
   }
 
+  // 邀请池健康检查(每轮都做,与人数无关):欠佣挂账不作废,但池不够时用户领不全,提醒社区补。
+  const [pool, owedTotal] = await Promise.all([router.referralPool(), router.totalOwed()]);
+  console.log(`邀请池 ${ethers.formatUnits(pool, 18)} SNOWBALL  |  未领返佣 ${ethers.formatUnits(owedTotal, 18)}`);
+  if (owedTotal > pool) {
+    console.log(`::warning::邀请池缺口 ${ethers.formatUnits(owedTotal - pool, 18)} SNOWBALL —— 请社区 fundReferral 补充(欠佣挂账不作废,但补上前用户领不全)。`);
+  }
+
   const n = Number(await router.usersLength());
   console.log(`router ${ROUTER}  参与者 ${n} 人`);
   if (n === 0) { console.log("暂无参与者,收工。"); return; }
@@ -95,14 +104,19 @@ async function main() {
     }
   }
 
-  // teamUsd = 整条下线 selfBuy 之和(带环保护)
+  // teamUsd = 整条下线 selfBuy 之和。环保护:合约不禁互绑(A↔B 可成环),若把环上祖先当子节点
+  // 累加,会把"自己的买入"算进自己的团队业绩(左右互绑刷量)。这里遇到祖先(inProg)整个跳过——
+  // 环边不计入,自己的买入永远进不了自己的 teamUsd。
   const memo = new Map(), inProg = new Set();
   function teamSum(u) {
     if (memo.has(u)) return memo.get(u);
     if (inProg.has(u)) return 0n;
     inProg.add(u);
     let s = 0n;
-    for (const c of children.get(u) || []) s += (selfBuyUsd.get(c) || 0n) + teamSum(c);
+    for (const c of children.get(u) || []) {
+      if (inProg.has(c)) continue; // back-edge (cycle): skip the ancestor entirely
+      s += (selfBuyUsd.get(c) || 0n) + teamSum(c);
+    }
     inProg.delete(u);
     memo.set(u, s);
     return s;

@@ -81,6 +81,9 @@ async function main() {
   ]);
   console.log(`keeper 钱包 ${wallet.address}  余额 ${ethers.formatEther(bal)} BNB`);
   console.log(`签约合约 ${STAKING}  预言机 ${oracleAddr}`);
+  if (bal > 0n && bal < ethers.parseEther("0.005")) {
+    console.log("::warning::keeper 热钱包 BNB 低于 0.005,撑不了几天了 —— 请尽快充值。");
+  }
 
   // 奖励池低余额告警(与 gas / poke 冷却都无关,每轮先查)。目的:快见底前就提醒社区 fundReward 补充,
   // 别等归零 —— 一旦池空时有人领奖,那几天会"发完即止"作废、补币也不追补。
