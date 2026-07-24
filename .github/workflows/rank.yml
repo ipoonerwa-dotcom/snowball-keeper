@@ -12,7 +12,7 @@ name: snowball-rank
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # 每 ~30 分钟重算一次(GitHub 定时尽力而为)
+    - cron: "*/15 * * * *"   # 每 ~15 分钟重算一次(GitHub 定时尽力而为;主触发建议用 cron-job.org 打 workflow_dispatch)
   workflow_dispatch: {}
 
 concurrency:
