@@ -1,0 +1,48 @@
+name: snowball-rank
+
+# 定期重算团队 U 业绩 + 等级并推上链(前端的"团队业绩/等级"读的就是这份链上数据)。
+# 调用只推 rank/teamUsd,热钱包(rankUpdater)无资金权限。
+#
+# 一次性设置(与 poke keeper 同一仓库即可,也可单独建仓):
+#   Secrets:  KEEPER_PK      = rankUpdater 热钱包私钥(owner 部署后 setRankUpdater(该地址) 授权)
+#             LOGS_RPC_URL   = 支持 getLogs 的端点(Alchemy BSC;含 key,放 Secret)
+#   Variables:SNOWBALL_BUY_ROUTER = buy-router 地址(部署后填)
+#             START_BLOCK    = buy-router 部署块
+#             可选:LOG_CHUNK / TIER_THRESHOLDS / PUSH_BATCH / RPC_URL
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # 每 ~30 分钟重算一次(GitHub 定时尽力而为)
+  workflow_dispatch: {}
+
+concurrency:
+  group: snowball-rank
+  cancel-in-progress: false
+
+jobs:
+  rank:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install deps
+        run: npm install --no-audit --no-fund
+      - name: Recompute ranks + push on-chain
+        env:
+          KEEPER_PK: ${{ secrets.KEEPER_PK }}
+          SNOWBALL_BUY_ROUTER: ${{ vars.SNOWBALL_BUY_ROUTER || secrets.SNOWBALL_BUY_ROUTER }}
+          RPC_URL: ${{ vars.RPC_URL || 'https://bsc-rpc.publicnode.com' }}
+          LOGS_RPC_URL: ${{ secrets.LOGS_RPC_URL || vars.LOGS_RPC_URL || '' }}
+          START_BLOCK: ${{ vars.START_BLOCK || '0' }}
+          LOG_CHUNK: ${{ vars.LOG_CHUNK || '5000' }}
+          TIER_THRESHOLDS: ${{ vars.TIER_THRESHOLDS || '' }}
+          PUSH_BATCH: ${{ vars.PUSH_BATCH || '' }}
+        run: |
+          if [ -z "$KEEPER_PK" ]; then
+            echo "::warning::KEEPER_PK 未设 —— 跳过。"
+            exit 0
+          fi
+          node snowball-rank.mjs
