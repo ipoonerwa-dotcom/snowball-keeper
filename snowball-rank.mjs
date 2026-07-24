@@ -1,40 +1,39 @@
-// Snowball 邀请 keeper —— 索引 buy-router 的买入/绑定事件,算每个人的团队 U 业绩 + 等级,批量推上链。
+// Snowball 邀请 keeper —— 算每个人的团队 U 业绩 + 等级,批量推上链。
+//
+// ★ 纯链上读,不用 getLogs/Alchemy ★:合约把用户 + 各人买入额存成可枚举的(users[] / selfBuyUsd /
+//   referrerOf),这里直接 view 读取(普通 BSC RPC 就行,不受免费档 getLogs 块范围限制)。
 //
 // 流程:
-//   1) getLogs 拉全 ReferrerBound + Bought 事件(从部署块起,分块)
-//   2) referrerOf[user] = 绑定事件里的邀请人;selfBuyUsd[buyer] = 该人自身买入 USD 累计
-//   3) teamUsd[user] = 整条下线(所有层级后代)的 selfBuyUsd 之和(不含自己)
+//   1) usersLength + 遍历 users[] 拿到全部参与者
+//   2) 读各人 referrerOf + selfBuyUsd
+//   3) teamUsd[user] = 整条下线(所有后代)的 selfBuyUsd 之和(带环保护)
 //   4) rank[user] = 按门槛 TIER_THRESHOLDS 定 V0..V5
-//   5) 读链上现值,只对变化的用户 setStats 批量推上链(省 gas)
+//   5) 读链上现值,只对变化的用户 setStats 批量推(省 gas)
 //
-// 权限:热钱包必须是合约的 rankUpdater(owner 部署后 setRankUpdater(该热钱包))。它只推 rank/teamUsd,
-//       碰不到任何资金。
+// 权限:热钱包必须是合约的 rankUpdater(owner 部署时已设)。只推 rank/teamUsd,无资金权限。
 //
-// 需要 ethers v6:  npm i ethers
 // 环境变量:
-//   RPC_URL               BSC RPC(推交易 + 读)
-//   LOGS_RPC_URL          支持 getLogs 的端点(Alchemy BSC;免费公共节点常封 getLogs)。缺省回退 RPC_URL
-//   KEEPER_PK             rankUpdater 热钱包私钥(只推等级,无资金权限)
-//   SNOWBALL_BUY_ROUTER   buy-router 地址(主网已部署:0x713EbB00E957d331c6959F545CCF6B6FD252050C)
-//   START_BLOCK           buy-router 部署块(主网:111870017;从这块起扫)
-//   LOG_CHUNK             单次 getLogs 块范围(默认 5000,按端点上限调)
+//   RPC_URL               BSC RPC(读 + 推交易;公共节点即可,不需要 Alchemy)
+//   KEEPER_PK             rankUpdater 热钱包私钥
+//   SNOWBALL_BUY_ROUTER   buy-router 地址
 //   TIER_THRESHOLDS       V1..V5 门槛(USD,逗号分隔),默认 5000,10000,20000,35000,50000
 //   PUSH_BATCH            单笔 setStats 推多少人(默认 120)
+//   READ_CHUNK            单批并发读多少个地址(默认 40)
 
 import { ethers } from "ethers";
 
 const RPC = process.env.RPC_URL || "https://bsc-rpc.publicnode.com";
-const LOGS_RPC = process.env.LOGS_RPC_URL || RPC;
 const PK = (() => { const k = (process.env.KEEPER_PK || "").trim(); return k ? (k.startsWith("0x") ? k : "0x" + k) : k; })();
 const ROUTER = (process.env.SNOWBALL_BUY_ROUTER || "").trim();
-const START_BLOCK = Number(process.env.START_BLOCK || 0);
-const LOG_CHUNK = Number(process.env.LOG_CHUNK || 5000);
 const THRESHOLDS = (process.env.TIER_THRESHOLDS || "5000,10000,20000,35000,50000").split(",").map((s) => Number(s.trim()));
 const PUSH_BATCH = Number(process.env.PUSH_BATCH || 120);
+const READ_CHUNK = Number(process.env.READ_CHUNK || 40);
 
 const ROUTER_ABI = [
-  "event ReferrerBound(address indexed user, address indexed referrer)",
-  "event Bought(address indexed buyer, address indexed referrer, uint256 bnbIn, uint256 tokensOut, uint256 usdValue, uint256 commission)",
+  "function usersLength() view returns (uint256)",
+  "function users(uint256) view returns (address)",
+  "function referrerOf(address) view returns (address)",
+  "function selfBuyUsd(address) view returns (uint256)",
   "function rank(address) view returns (uint8)",
   "function teamUsd(address) view returns (uint256)",
   "function rankUpdater() view returns (address)",
@@ -47,21 +46,12 @@ function rankOf(teamUsdNum) {
   return Math.min(r, 5);
 }
 
-async function getLogsChunked(provider, address, topics, fromBlock, toBlock) {
+// 分批并发跑,避免一次几百个 eth_call 打爆 RPC
+async function mapChunked(items, fn, size) {
   const out = [];
-  for (let from = fromBlock; from <= toBlock; from += LOG_CHUNK) {
-    const to = Math.min(from + LOG_CHUNK - 1, toBlock);
-    let tries = 0;
-    while (true) {
-      try {
-        const logs = await provider.getLogs({ address, topics, fromBlock: from, toBlock: to });
-        out.push(...logs);
-        break;
-      } catch (e) {
-        if (++tries >= 3) { console.log(`  getLogs ${from}-${to} 失败(跳过):`, e.shortMessage || e.message); break; }
-        await new Promise((r) => setTimeout(r, 800));
-      }
-    }
+  for (let i = 0; i < items.length; i += size) {
+    const part = await Promise.all(items.slice(i, i + size).map(fn));
+    out.push(...part);
   }
   return out;
 }
@@ -71,9 +61,7 @@ async function main() {
   if (!/^0x[0-9a-fA-F]{40}$/.test(ROUTER)) { console.log("SNOWBALL_BUY_ROUTER 未设或非法 —— 跳过(部署后填)。"); return; }
 
   const provider = new ethers.JsonRpcProvider(RPC, 56, { staticNetwork: true });
-  const logsProvider = new ethers.JsonRpcProvider(LOGS_RPC, 56, { staticNetwork: true });
   const wallet = new ethers.Wallet(PK, provider);
-  const iface = new ethers.Interface(ROUTER_ABI);
   const router = new ethers.Contract(ROUTER, ROUTER_ABI, wallet);
 
   const updater = await router.rankUpdater();
@@ -82,43 +70,36 @@ async function main() {
     return;
   }
 
-  const latest = await provider.getBlockNumber();
-  console.log(`扫块 ${START_BLOCK}..${latest}  router ${ROUTER}`);
+  const n = Number(await router.usersLength());
+  console.log(`router ${ROUTER}  参与者 ${n} 人`);
+  if (n === 0) { console.log("暂无参与者,收工。"); return; }
 
-  const boundTopic = iface.getEvent("ReferrerBound").topicHash;
-  const boughtTopic = iface.getEvent("Bought").topicHash;
-  const rawBound = await getLogsChunked(logsProvider, ROUTER, [boundTopic], START_BLOCK, latest);
-  const rawBought = await getLogsChunked(logsProvider, ROUTER, [boughtTopic], START_BLOCK, latest);
-  console.log(`ReferrerBound: ${rawBound.length}  Bought: ${rawBought.length}`);
+  const idx = Array.from({ length: n }, (_, i) => i);
+  const users = (await mapChunked(idx, (i) => router.users(i), READ_CHUNK)).map((a) => a.toLowerCase());
+  const info = await mapChunked(
+    users,
+    async (u) => {
+      const [ref, self] = await Promise.all([router.referrerOf(u), router.selfBuyUsd(u)]);
+      return { u, ref: ref.toLowerCase(), self };
+    },
+    READ_CHUNK,
+  );
 
-  const referrerOf = new Map(); // user -> referrer
-  for (const lg of rawBound) {
-    const p = iface.parseLog(lg);
-    const user = p.args.user.toLowerCase();
-    if (!referrerOf.has(user)) referrerOf.set(user, p.args.referrer.toLowerCase());
-  }
-  const selfBuyUsd = new Map(); // addr -> bigint(1e18)
-  for (const lg of rawBought) {
-    const p = iface.parseLog(lg);
-    const buyer = p.args.buyer.toLowerCase();
-    selfBuyUsd.set(buyer, (selfBuyUsd.get(buyer) || 0n) + p.args.usdValue);
-  }
-
-  // children map + full universe of addresses
+  const selfBuyUsd = new Map();
   const children = new Map();
-  const universe = new Set();
-  for (const [user, ref] of referrerOf) {
-    universe.add(user); universe.add(ref);
-    if (!children.has(ref)) children.set(ref, []);
-    children.get(ref).push(user);
+  for (const { u, ref, self } of info) {
+    selfBuyUsd.set(u, self);
+    if (ref !== "0x0000000000000000000000000000000000000000") {
+      if (!children.has(ref)) children.set(ref, []);
+      children.get(ref).push(u);
+    }
   }
-  for (const a of selfBuyUsd.keys()) universe.add(a);
 
   // teamUsd = 整条下线 selfBuy 之和(带环保护)
   const memo = new Map(), inProg = new Set();
   function teamSum(u) {
     if (memo.has(u)) return memo.get(u);
-    if (inProg.has(u)) return 0n; // cycle guard
+    if (inProg.has(u)) return 0n;
     inProg.add(u);
     let s = 0n;
     for (const c of children.get(u) || []) s += (selfBuyUsd.get(c) || 0n) + teamSum(c);
@@ -127,38 +108,32 @@ async function main() {
     return s;
   }
 
-  // compute desired (rank, teamUsd) for everyone, diff vs on-chain
-  const users = [...universe];
   const desired = users.map((u) => {
     const tuWei = teamSum(u);
-    const tuNum = Number(ethers.formatUnits(tuWei, 18));
-    return { u, rank: rankOf(tuNum), teamUsdWei: tuWei };
+    return { u, rank: rankOf(Number(ethers.formatUnits(tuWei, 18))), teamUsdWei: tuWei };
   });
 
-  // read current on-chain values (chunked Promise.all)
+  // diff vs 链上现值
   const changed = [];
-  for (let i = 0; i < desired.length; i += 50) {
-    const slice = desired.slice(i, i + 50);
-    const cur = await Promise.all(
-      slice.map(async (d) => {
-        const [r, t] = await Promise.all([router.rank(d.u), router.teamUsd(d.u)]);
-        return { r: Number(r), t };
-      }),
-    );
-    slice.forEach((d, j) => {
-      if (cur[j].r !== d.rank || cur[j].t !== d.teamUsdWei) changed.push(d);
-    });
-  }
-  console.log(`需更新 ${changed.length}/${users.length} 人`);
+  await mapChunked(
+    desired,
+    async (d) => {
+      const [r, t] = await Promise.all([router.rank(d.u), router.teamUsd(d.u)]);
+      if (Number(r) !== d.rank || t !== d.teamUsdWei) changed.push(d);
+    },
+    READ_CHUNK,
+  );
+  console.log(`需更新 ${changed.length}/${n} 人`);
   if (changed.length === 0) { console.log("无变化,收工。"); return; }
 
-  // push in batches
   for (let i = 0; i < changed.length; i += PUSH_BATCH) {
     const b = changed.slice(i, i + PUSH_BATCH);
-    const addrs = b.map((d) => d.u);
-    const ranks = b.map((d) => d.rank);
-    const tus = b.map((d) => d.teamUsdWei);
-    const tx = await router.setStats(addrs, ranks, tus, { gasLimit: 300000n + BigInt(b.length) * 45000n });
+    const tx = await router.setStats(
+      b.map((d) => d.u),
+      b.map((d) => d.rank),
+      b.map((d) => d.teamUsdWei),
+      { gasLimit: 300000n + BigInt(b.length) * 45000n },
+    );
     await tx.wait(1);
     console.log(`  setStats ${i}..${i + b.length}  ${tx.hash}`);
   }
