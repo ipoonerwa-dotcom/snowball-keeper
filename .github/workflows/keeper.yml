@@ -45,6 +45,8 @@ jobs:
           SNOWBALL_STAKING: ${{ vars.SNOWBALL_STAKING || secrets.SNOWBALL_STAKING }}
           RPC_URL: ${{ vars.RPC_URL || 'https://bsc-rpc.publicnode.com' }}
           WINDOW_WAIT_MS: ${{ vars.WINDOW_WAIT_MS || '' }}
+          # 奖励池低于此值(整枚 SNOWBALL)且已有签约本金 → Actions 里报 warning,提醒社区补币。默认 4000。
+          LOW_RESERVE_ALERT: ${{ vars.LOW_RESERVE_ALERT || '' }}
         run: |
           if [ -z "$KEEPER_PK" ]; then
             echo "::warning::KEEPER_PK 未设 —— 跳过。到仓库 Settings → Secrets 添加后启用。"

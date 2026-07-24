@@ -25,6 +25,9 @@ const PK = (() => {
 })();
 const STAKING = (process.env.SNOWBALL_STAKING || "").trim();
 const OVERRIDE_WAIT = Number(process.env.WINDOW_WAIT_MS || 0);
+// 奖励池低余额告警阈值(整枚 SNOWBALL)。低于它且已有签约本金 → 报警,提醒社区 fundReward 补充,
+// 避免用户领奖时撞上"发完即止"作废。默认 4000(4 万目标的 10%,留足补币时间)。
+const LOW_RESERVE_ALERT = Number(process.env.LOW_RESERVE_ALERT || 4000);
 
 const STAKING_ABI = [
   "function oracle() view returns (address)",
@@ -32,6 +35,8 @@ const STAKING_ABI = [
   "function currentDayIdx() view returns (uint256)",
   "function lastPokeTime() view returns (uint256)",
   "function pokeInterval() view returns (uint256)",
+  "function rewardReserve() view returns (uint256)",
+  "function totalPrincipal() view returns (uint256)",
 ];
 const ORACLE_ABI = [
   "function refreshBaseline()",
@@ -68,9 +73,27 @@ async function main() {
   const wallet = new ethers.Wallet(PK, provider);
   const staking = new ethers.Contract(STAKING, STAKING_ABI, wallet);
 
-  const [bal, oracleAddr] = await Promise.all([provider.getBalance(wallet.address), staking.oracle()]);
+  const [bal, oracleAddr, reserve, principal] = await Promise.all([
+    provider.getBalance(wallet.address),
+    staking.oracle(),
+    staking.rewardReserve(),
+    staking.totalPrincipal(),
+  ]);
   console.log(`keeper 钱包 ${wallet.address}  余额 ${ethers.formatEther(bal)} BNB`);
   console.log(`签约合约 ${STAKING}  预言机 ${oracleAddr}`);
+
+  // 奖励池低余额告警(与 gas / poke 冷却都无关,每轮先查)。目的:快见底前就提醒社区 fundReward 补充,
+  // 别等归零 —— 一旦池空时有人领奖,那几天会"发完即止"作废、补币也不追补。
+  const reserveTokens = Number(ethers.formatUnits(reserve, 18));
+  console.log(`奖励池剩余 ${reserveTokens.toFixed(2)} SNOWBALL  |  签约本金 ${Number(ethers.formatUnits(principal, 18)).toFixed(2)}`);
+  if (reserveTokens < LOW_RESERVE_ALERT) {
+    if (principal === 0n) {
+      console.log(`::notice::奖励池 ${reserveTokens.toFixed(0)} < ${LOW_RESERVE_ALERT},但暂无签约本金;上线前记得 fundReward 注资即可。`);
+    } else {
+      console.log(`::warning::⚠️ 奖励池仅剩 ${reserveTokens.toFixed(2)} SNOWBALL(< ${LOW_RESERVE_ALERT} 阈值),已有签约本金 ${Number(ethers.formatUnits(principal, 18)).toFixed(2)} —— 请尽快 fundReward 补充,避免用户领奖撞上"发完即止"作废。`);
+    }
+  }
+
   if (bal === 0n) {
     console.log("::warning::热钱包 BNB 为 0 —— 无法付 gas,请先充一点 BNB。");
     return;
