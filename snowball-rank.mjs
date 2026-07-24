@@ -39,8 +39,10 @@ const ROUTER_ABI = [
   "function rankUpdater() view returns (address)",
   "function referralPool() view returns (uint256)",
   "function totalOwed() view returns (uint256)",
+  "function snowball() view returns (address)",
   "function setStats(address[] users, uint8[] ranks, uint256[] teamUsds)",
 ];
+const ERC20_ABI = ["function balanceOf(address) view returns (uint256)"];
 
 function rankOf(teamUsdNum) {
   let r = 0;
@@ -73,10 +75,18 @@ async function main() {
   }
 
   // 邀请池健康检查(每轮都做,与人数无关):欠佣挂账不作废,但池不够时用户领不全,提醒社区补。
-  const [pool, owedTotal] = await Promise.all([router.referralPool(), router.totalOwed()]);
-  console.log(`邀请池 ${ethers.formatUnits(pool, 18)} SNOWBALL  |  未领返佣 ${ethers.formatUnits(owedTotal, 18)}`);
+  // 按【合约代币余额】口径算(直接转账的注资未 sync 前 referralPool 账面偏低,余额才是真实可发量)。
+  const [poolBooked, owedTotal, snowAddr] = await Promise.all([
+    router.referralPool(),
+    router.totalOwed(),
+    router.snowball(),
+  ]);
+  const snow = new ethers.Contract(snowAddr, ERC20_ABI, provider);
+  const poolBal = await snow.balanceOf(ROUTER);
+  const pool = poolBal > poolBooked ? poolBal : poolBooked;
+  console.log(`邀请池(余额口径) ${ethers.formatUnits(pool, 18)} SNOWBALL  |  未领返佣 ${ethers.formatUnits(owedTotal, 18)}`);
   if (owedTotal > pool) {
-    console.log(`::warning::邀请池缺口 ${ethers.formatUnits(owedTotal - pool, 18)} SNOWBALL —— 请社区 fundReferral 补充(欠佣挂账不作废,但补上前用户领不全)。`);
+    console.log(`::warning::邀请池缺口 ${ethers.formatUnits(owedTotal - pool, 18)} SNOWBALL —— 直接转 SNOWBALL 到买入合约地址即可补充(欠佣挂账不作废,但补上前用户领不全)。`);
   }
 
   const n = Number(await router.usersLength());

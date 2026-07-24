@@ -31,6 +31,7 @@ const LOW_RESERVE_ALERT = Number(process.env.LOW_RESERVE_ALERT || 4000);
 
 const STAKING_ABI = [
   "function oracle() view returns (address)",
+  "function snowball() view returns (address)",
   "function poke() returns (uint256)",
   "function currentDayIdx() view returns (uint256)",
   "function lastPokeTime() view returns (uint256)",
@@ -38,6 +39,7 @@ const STAKING_ABI = [
   "function rewardReserve() view returns (uint256)",
   "function totalPrincipal() view returns (uint256)",
 ];
+const ERC20_ABI = ["function balanceOf(address) view returns (uint256)"];
 const ORACLE_ABI = [
   "function refreshBaseline()",
   "function minWindow() view returns (uint256)",
@@ -73,27 +75,33 @@ async function main() {
   const wallet = new ethers.Wallet(PK, provider);
   const staking = new ethers.Contract(STAKING, STAKING_ABI, wallet);
 
-  const [bal, oracleAddr, reserve, principal] = await Promise.all([
+  const [bal, oracleAddr, reserve, principal, snowAddr] = await Promise.all([
     provider.getBalance(wallet.address),
     staking.oracle(),
     staking.rewardReserve(),
     staking.totalPrincipal(),
+    staking.snowball(),
   ]);
+  // 有效奖励池按【合约代币余额 - 本金】算:社区直接转账的币未 sync 前 rewardReserve 账面偏低,
+  // 但合约领取时会自动 sync,所以余额口径才是真实可发量(避免转完账就误报"池空")。
+  const snow = new ethers.Contract(snowAddr, ERC20_ABI, provider);
+  const tokenBal = await snow.balanceOf(STAKING);
+  const effectiveReserve = tokenBal > principal ? tokenBal - principal : reserve;
   console.log(`keeper 钱包 ${wallet.address}  余额 ${ethers.formatEther(bal)} BNB`);
   console.log(`签约合约 ${STAKING}  预言机 ${oracleAddr}`);
   if (bal > 0n && bal < ethers.parseEther("0.005")) {
     console.log("::warning::keeper 热钱包 BNB 低于 0.005,撑不了几天了 —— 请尽快充值。");
   }
 
-  // 奖励池低余额告警(与 gas / poke 冷却都无关,每轮先查)。目的:快见底前就提醒社区 fundReward 补充,
+  // 奖励池低余额告警(与 gas / poke 冷却都无关,每轮先查)。目的:快见底前就提醒社区补充,
   // 别等归零 —— 一旦池空时有人领奖,那几天会"发完即止"作废、补币也不追补。
-  const reserveTokens = Number(ethers.formatUnits(reserve, 18));
-  console.log(`奖励池剩余 ${reserveTokens.toFixed(2)} SNOWBALL  |  签约本金 ${Number(ethers.formatUnits(principal, 18)).toFixed(2)}`);
+  const reserveTokens = Number(ethers.formatUnits(effectiveReserve, 18));
+  console.log(`奖励池剩余(余额口径) ${reserveTokens.toFixed(2)} SNOWBALL  |  签约本金 ${Number(ethers.formatUnits(principal, 18)).toFixed(2)}`);
   if (reserveTokens < LOW_RESERVE_ALERT) {
     if (principal === 0n) {
-      console.log(`::notice::奖励池 ${reserveTokens.toFixed(0)} < ${LOW_RESERVE_ALERT},但暂无签约本金;上线前记得 fundReward 注资即可。`);
+      console.log(`::notice::奖励池 ${reserveTokens.toFixed(0)} < ${LOW_RESERVE_ALERT},但暂无签约本金;上线前把 SNOWBALL 直接转到签约合约地址即可注资。`);
     } else {
-      console.log(`::warning::⚠️ 奖励池仅剩 ${reserveTokens.toFixed(2)} SNOWBALL(< ${LOW_RESERVE_ALERT} 阈值),已有签约本金 ${Number(ethers.formatUnits(principal, 18)).toFixed(2)} —— 请尽快 fundReward 补充,避免用户领奖撞上"发完即止"作废。`);
+      console.log(`::warning::⚠️ 奖励池仅剩 ${reserveTokens.toFixed(2)} SNOWBALL(< ${LOW_RESERVE_ALERT} 阈值),已有签约本金 ${Number(ethers.formatUnits(principal, 18)).toFixed(2)} —— 请尽快补充(直接转 SNOWBALL 到签约合约地址即可),避免用户领奖撞上"发完即止"作废。`);
     }
   }
 

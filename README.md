@@ -23,7 +23,8 @@
 1. 新建仓库(**建议公开** → Actions 分钟免费),把本目录推上去。
 2. Settings → Secrets and variables → Actions:
    - **Secret** `KEEPER_PK` = 新热钱包私钥(`0x…`)
-   - **Variable** `SNOWBALL_STAKING` = `0xD01870FFD8Af16FEB1Cd282e0878e8B32B93Fb64`(BSC 主网已部署;预言机 `0x66A3266017446b5F4aACEaC60de7b29eb5508500` 脚本自动从 `staking.oracle()` 读)
+   - **Variable** `SNOWBALL_STAKING` = `0xe04ca7Abe8B8FA905E12678e7Df1F506f88BBc55`(BSC 主网 v2,支持直接转账注资;预言机 `0x66A3266017446b5F4aACEaC60de7b29eb5508500` 脚本自动从 `staking.oracle()` 读)
+   - **Variable** `SNOWBALL_BUY_ROUTER` = `0x3B9C23beFeA243A17769E462EcE630c8A2AC87ff`(rank keeper 用,同样 v2 支持直接转账注资)
    - 可选 Variable:`RPC_URL`、`WINDOW_WAIT_MS`、`LOW_RESERVE_ALERT`(奖励池低于此值且已有签约本金 → Actions 报 warning 提醒补币,默认 4000)
 3. 时间表见 `.github/workflows/keeper.yml`:北京 00:00 / 00:20 / 01:00 三次冗余,首次成功后其余自动早退。也可在 Actions 页手动 Run。
 
