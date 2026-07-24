@@ -15,8 +15,8 @@
 //   RPC_URL               BSC RPC(推交易 + 读)
 //   LOGS_RPC_URL          支持 getLogs 的端点(Alchemy BSC;免费公共节点常封 getLogs)。缺省回退 RPC_URL
 //   KEEPER_PK             rankUpdater 热钱包私钥(只推等级,无资金权限)
-//   SNOWBALL_BUY_ROUTER   buy-router 地址
-//   START_BLOCK           buy-router 部署块(从这块起扫;不填=0,慢)
+//   SNOWBALL_BUY_ROUTER   buy-router 地址(主网已部署:0x713EbB00E957d331c6959F545CCF6B6FD252050C)
+//   START_BLOCK           buy-router 部署块(主网:111870017;从这块起扫)
 //   LOG_CHUNK             单次 getLogs 块范围(默认 5000,按端点上限调)
 //   TIER_THRESHOLDS       V1..V5 门槛(USD,逗号分隔),默认 5000,10000,20000,35000,50000
 //   PUSH_BATCH            单笔 setStats 推多少人(默认 120)
