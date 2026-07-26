@@ -29,20 +29,27 @@ const THRESHOLDS = (process.env.TIER_THRESHOLDS || "5000,10000,20000,35000,50000
 const PUSH_BATCH = Number(process.env.PUSH_BATCH || 120);
 const READ_CHUNK = Number(process.env.READ_CHUNK || 40);
 
+// SnowballBuyRecorder(0x3f2fdAc1…):只记录不发钱,setStats 推的等级/团队业绩【仅供前端展示】,
+// 不挂钩任何链上打款(返佣由项目方按 DApp /admin 后台清单人工发放),所以推错不会造成资金损失。
 const ROUTER_ABI = [
   "function usersLength() view returns (uint256)",
   "function users(uint256) view returns (address)",
   "function referrerOf(address) view returns (address)",
-  "function selfBuyUsd(address) view returns (uint256)",
+  "function totalUsdOf(address) view returns (uint256)",
+  "function totalTokensOf(address) view returns (uint256)",
   "function rank(address) view returns (uint8)",
   "function teamUsd(address) view returns (uint256)",
-  "function rankUpdater() view returns (address)",
-  "function referralPool() view returns (uint256)",
-  "function totalOwed() view returns (uint256)",
+  "function statsUpdater() view returns (address)",
   "function snowball() view returns (address)",
-  "function setStats(address[] users, uint8[] ranks, uint256[] teamUsds)",
+  "function setStats(address[] accounts, uint8[] ranks, uint256[] teamUsds)",
 ];
 const ERC20_ABI = ["function balanceOf(address) view returns (uint256)"];
+// 质押也算持有(买了去签约是最强的留存证明,不能因为币离开钱包就judge成卖出)
+const STAKING_ABI = [
+  "function positionCount(address) view returns (uint256)",
+  "function positions(address,uint256) view returns (uint256,uint256,uint256,uint256,uint256,uint256,bool)",
+];
+const STAKING = process.env.SNOWBALL_STAKING || "0xe04ca7Abe8B8FA905E12678e7Df1F506f88BBc55";
 
 function rankOf(teamUsdNum) {
   let r = 0;
@@ -68,53 +75,62 @@ async function main() {
   const wallet = new ethers.Wallet(PK, provider);
   const router = new ethers.Contract(ROUTER, ROUTER_ABI, wallet);
 
-  const updater = await router.rankUpdater();
+  const updater = await router.statsUpdater();
   if (updater.toLowerCase() !== wallet.address.toLowerCase()) {
-    console.log(`::warning::热钱包 ${wallet.address} 不是 rankUpdater(当前 ${updater})。owner 需 setRankUpdater(该热钱包)。`);
+    console.log(`::warning::热钱包 ${wallet.address} 不是 statsUpdater(当前 ${updater})。owner 需 setStatsUpdater(该热钱包)。`);
     return;
   }
 
-  // 邀请池健康检查(每轮都做,与人数无关):欠佣挂账不作废,但池不够时用户领不全,提醒社区补。
-  // 按【合约代币余额】口径算(直接转账的注资未 sync 前 referralPool 账面偏低,余额才是真实可发量)。
-  const [poolBooked, owedTotal, snowAddr] = await Promise.all([
-    router.referralPool(),
-    router.totalOwed(),
-    router.snowball(),
-  ]);
+  const snowAddr = await router.snowball();
   const snow = new ethers.Contract(snowAddr, ERC20_ABI, provider);
-  const poolBal = await snow.balanceOf(ROUTER);
-  const pool = poolBal > poolBooked ? poolBal : poolBooked;
-  console.log(`邀请池(余额口径) ${ethers.formatUnits(pool, 18)} SNOWBALL  |  未领返佣 ${ethers.formatUnits(owedTotal, 18)}`);
-  if (owedTotal > pool) {
-    console.log(`::warning::邀请池缺口 ${ethers.formatUnits(owedTotal - pool, 18)} SNOWBALL —— 直接转 SNOWBALL 到买入合约地址即可补充(欠佣挂账不作废,但补上前用户领不全)。`);
-  }
-
+  const staking = new ethers.Contract(STAKING, STAKING_ABI, provider);
+  // 新合约不托管任何资金,没有邀请池,也没有链上欠佣 —— 返佣走后台清单人工发放,
+  // 所以这里不再做"池子够不够"的检查(那是旧的自动发放模式才需要的)。
   const n = Number(await router.usersLength());
-  console.log(`router ${ROUTER}  参与者 ${n} 人`);
+  console.log(`recorder ${ROUTER}  参与者 ${n} 人`);
   if (n === 0) { console.log("暂无参与者,收工。"); return; }
 
   const idx = Array.from({ length: n }, (_, i) => i);
   const users = (await mapChunked(idx, (i) => router.users(i), READ_CHUNK)).map((a) => a.toLowerCase());
+
+  // 社区规则「卖出就不算团队业绩」:每人的有效业绩 = 累计买入USD × 留存比例。
+  //   留存 = (钱包余额 + 未取回的质押本金),按【经本 DApp 累计买到的量】封顶
+  //   —— 封顶是必须的,否则场外转进来的币会把业绩刷高。
+  // 全卖 → 留存 0 → 有效业绩 0;卖一半 → 折半。与 /admin 后台口径完全一致。
   const info = await mapChunked(
     users,
     async (u) => {
-      const [ref, self] = await Promise.all([router.referrerOf(u), router.selfBuyUsd(u)]);
-      return { u, ref: ref.toLowerCase(), self };
+      const [ref, boughtUsd, boughtTok, held, posCnt] = await Promise.all([
+        router.referrerOf(u), router.totalUsdOf(u), router.totalTokensOf(u),
+        snow.balanceOf(u), staking.positionCount(u),
+      ]);
+      let staked = 0n;
+      for (let i = 0; i < Number(posCnt); i++) {
+        const p = await staking.positions(u, i);
+        if (!p[6]) staked += p[0]; // 未取回的本金
+      }
+      const kept = held + staked;
+      const retained = boughtTok > 0n ? (kept < boughtTok ? kept : boughtTok) : 0n;
+      const self = boughtTok > 0n ? (boughtUsd * retained) / boughtTok : 0n;
+      return { u, ref: ref.toLowerCase(), self, gross: boughtUsd };
     },
     READ_CHUNK,
   );
 
   const selfBuyUsd = new Map();
   const children = new Map();
-  for (const { u, ref, self } of info) {
+  let grossAll = 0n, netAll = 0n;
+  for (const { u, ref, self, gross } of info) {
     selfBuyUsd.set(u, self);
+    grossAll += gross; netAll += self;
     if (ref !== "0x0000000000000000000000000000000000000000") {
       if (!children.has(ref)) children.set(ref, []);
       children.get(ref).push(u);
     }
   }
+  console.log(`累计买入 $${ethers.formatUnits(grossAll, 18)} → 扣除已卖出后有效 $${ethers.formatUnits(netAll, 18)}`);
 
-  // teamUsd = 整条下线 selfBuy 之和。环保护:合约不禁互绑(A↔B 可成环),若把环上祖先当子节点
+  // teamUsd = 整条下线【有效业绩】之和。环保护:合约不禁互绑(A↔B 可成环),若把环上祖先当子节点
   // 累加,会把"自己的买入"算进自己的团队业绩(左右互绑刷量)。这里遇到祖先(inProg)整个跳过——
   // 环边不计入,自己的买入永远进不了自己的 teamUsd。
   const memo = new Map(), inProg = new Set();
