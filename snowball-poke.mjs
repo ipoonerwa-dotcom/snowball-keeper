@@ -18,7 +18,52 @@
 
 import { ethers } from "ethers";
 
-const RPC = process.env.RPC_URL || "https://bsc-rpc.publicnode.com";
+/**
+ * 候选 RPC(RPC_URL 支持逗号分隔多个;不设就用这份默认)。
+ *
+ * 【为什么要多个 + 开跑前先探测】
+ * 2026-07-29 连挂 4 次的真因:publicnode 对 GitHub runner 的机房 IP【只封写不封读】——
+ * 所有 view 调用都正常,一到 refreshBaseline() 发交易就 `server response 403 Forbidden`,
+ * 脚本 20 多秒就退出、当天奖励没结算。而且这个故障【在本地复现不出来】:同一个节点从家里
+ * 发交易完全正常,是按来源 IP 封的。所以不能靠"挑一个看起来好的节点"—— 只能让脚本
+ * 在真实运行环境里自己试。
+ */
+const RPC_CANDIDATES = (process.env.RPC_URL || [
+  "https://bsc-dataseed.bnbchain.org",
+  "https://rpc-bsc.48.club",
+  "https://bsc-dataseed1.defibit.io",
+  "https://bsc-rpc.publicnode.com",
+].join(","))
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+/**
+ * 挑一个【能发交易】的节点:拿一笔格式错误的假交易去问 eth_sendRawTransaction。
+ * 回 JSON-RPC 错误(方法开放、只是参数不对)= 可用;回 HTTP 403/4xx/5xx = 被封,跳过。
+ * 不花 gas、不上链,而且测的正是真实失败的那一步 —— 比"能不能读区块高度"靠谱得多。
+ */
+async function pickWritableRpc() {
+  for (const url of RPC_CANDIDATES) {
+    try {
+      const r = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_sendRawTransaction", params: ["0xdeadbeef"] }),
+        signal: AbortSignal.timeout(12000),
+      });
+      if (!r.ok) { console.log(`   ${url} → HTTP ${r.status},跳过`); continue; }
+      const j = await r.json().catch(() => null);
+      if (j && j.error) { console.log(`   ${url} → 可发交易 ✓`); return url; }
+      console.log(`   ${url} → 响应异常,跳过`);
+    } catch (e) {
+      console.log(`   ${url} → ${String(e).slice(0, 70)},跳过`);
+    }
+  }
+  return null;
+}
+
+let RPC = RPC_CANDIDATES[0];
 const PK = (() => {
   const k = (process.env.KEEPER_PK || "").trim();
   return k ? (k.startsWith("0x") ? k : "0x" + k) : k;
@@ -70,6 +115,17 @@ async function main() {
     console.log("SNOWBALL_STAKING 未设或非法 —— 跳过(合约部署后把地址填进环境变量)。");
     return;
   }
+
+  // 先选一个真能发交易的节点。全都不行就直接报错退出 —— 与其闷头跑到一半 403,
+  // 不如在这里说清楚,Actions 里一眼能看到是节点封了而不是合约出问题。
+  console.log("探测可用 RPC:");
+  const picked = await pickWritableRpc();
+  if (!picked) {
+    console.log("::error::候选 RPC 全部不接受发送交易(多半被按 IP 封了)。请在仓库 Variables 里把 RPC_URL 设成一个可用节点(支持逗号分隔多个)。");
+    process.exitCode = 1;
+    return;
+  }
+  RPC = picked;
 
   const provider = new ethers.JsonRpcProvider(RPC, 56, { staticNetwork: true });
   const wallet = new ethers.Wallet(PK, provider);
