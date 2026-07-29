@@ -11,7 +11,7 @@
 // 运行:  node snowball-poke.mjs           (跑一轮就退出,适合 cron / GitHub Actions)
 // 需要 ethers v6:  npm i ethers
 // 环境变量:
-//   RPC_URL           BSC RPC(默认公共节点)
+//   RPC_URL           BSC RPC;留空用自带候选列表,支持逗号分隔多个(逐个尝试)
 //   KEEPER_PK         热钱包私钥(只放少量 BNB 付 gas;绝不用 owner/部署私钥)
 //   SNOWBALL_STAKING  签约合约地址(oracle 地址会自动从 staking.oracle() 读)
 //   WINDOW_WAIT_MS    refreshBaseline 后等待毫秒数(默认按合约 minWindow + 90s,自动算)
@@ -21,12 +21,12 @@ import { ethers } from "ethers";
 /**
  * 候选 RPC(RPC_URL 支持逗号分隔多个;不设就用这份默认)。
  *
- * 【为什么要多个 + 开跑前先探测】
+ * 【为什么要一组而不是一个】
  * 2026-07-29 连挂 4 次的真因:publicnode 对 GitHub runner 的机房 IP【只封写不封读】——
  * 所有 view 调用都正常,一到 refreshBaseline() 发交易就 `server response 403 Forbidden`,
  * 脚本 20 多秒就退出、当天奖励没结算。而且这个故障【在本地复现不出来】:同一个节点从家里
- * 发交易完全正常,是按来源 IP 封的。所以不能靠"挑一个看起来好的节点"—— 只能让脚本
- * 在真实运行环境里自己试。
+ * 发交易完全正常,是按来源 IP 封的。
+ * 怎么用见 sendWithFallback —— 不预测、拿真交易挨个试。
  */
 const RPC_CANDIDATES = (process.env.RPC_URL || [
   "https://bsc-dataseed.bnbchain.org",
@@ -39,28 +39,35 @@ const RPC_CANDIDATES = (process.env.RPC_URL || [
   .filter(Boolean);
 
 /**
- * 挑一个【能发交易】的节点:拿一笔格式错误的假交易去问 eth_sendRawTransaction。
- * 回 JSON-RPC 错误(方法开放、只是参数不对)= 可用;回 HTTP 403/4xx/5xx = 被封,跳过。
- * 不花 gas、不上链,而且测的正是真实失败的那一步 —— 比"能不能读区块高度"靠谱得多。
+ * 发交易 + 节点故障自动换台。
+ *
+ * 【为什么不能靠"开跑前探测"】
+ * 第一版我用一笔格式错误的假交易去问 eth_sendRawTransaction,想靠"回 JSON-RPC 错误 = 可用"
+ * 提前挑节点 —— 线上直接被打脸:publicnode 对畸形假交易正常回错误(判定为可用),
+ * 对【真实签名交易】照样 403。也就是说封禁只在真交易上触发,任何代理信号都测不出来。
+ * 所以不预测了:直接拿真交易挨个试,某个节点抛错就换下一个。
+ *
+ * 节点级失败(403/超时/连接断)时交易【根本没广播出去】,nonce 不受影响,换台重发是安全的。
+ * @param label 日志用名字
+ * @param send  (wallet, provider) => 交易响应;拿到就等 1 个确认
  */
-async function pickWritableRpc() {
+async function sendWithFallback(label, send) {
+  let lastErr = null;
   for (const url of RPC_CANDIDATES) {
     try {
-      const r = await fetch(url, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_sendRawTransaction", params: ["0xdeadbeef"] }),
-        signal: AbortSignal.timeout(12000),
-      });
-      if (!r.ok) { console.log(`   ${url} → HTTP ${r.status},跳过`); continue; }
-      const j = await r.json().catch(() => null);
-      if (j && j.error) { console.log(`   ${url} → 可发交易 ✓`); return url; }
-      console.log(`   ${url} → 响应异常,跳过`);
+      const provider = new ethers.JsonRpcProvider(url, 56, { staticNetwork: true });
+      const wallet = new ethers.Wallet(PK, provider);
+      const tx = await send(wallet, provider);
+      await tx.wait(1);
+      console.log(`   ✓ ${label} ${tx.hash}   (${url})`);
+      return { tx, url, provider, wallet };
     } catch (e) {
-      console.log(`   ${url} → ${String(e).slice(0, 70)},跳过`);
+      lastErr = e;
+      const msg = revertReason(e);
+      console.log(`   ${label} 在 ${url} 失败:${String(msg).slice(0, 90)} —— 换下一个节点`);
     }
   }
-  return null;
+  throw lastErr || new Error(`${label}: 所有候选 RPC 都失败`);
 }
 
 let RPC = RPC_CANDIDATES[0];
@@ -115,17 +122,6 @@ async function main() {
     console.log("SNOWBALL_STAKING 未设或非法 —— 跳过(合约部署后把地址填进环境变量)。");
     return;
   }
-
-  // 先选一个真能发交易的节点。全都不行就直接报错退出 —— 与其闷头跑到一半 403,
-  // 不如在这里说清楚,Actions 里一眼能看到是节点封了而不是合约出问题。
-  console.log("探测可用 RPC:");
-  const picked = await pickWritableRpc();
-  if (!picked) {
-    console.log("::error::候选 RPC 全部不接受发送交易(多半被按 IP 封了)。请在仓库 Variables 里把 RPC_URL 设成一个可用节点(支持逗号分隔多个)。");
-    process.exitCode = 1;
-    return;
-  }
-  RPC = picked;
 
   const provider = new ethers.JsonRpcProvider(RPC, 56, { staticNetwork: true });
   const wallet = new ethers.Wallet(PK, provider);
@@ -187,9 +183,11 @@ async function main() {
 
   // 步骤 1:刷新基线快照
   console.log("① refreshBaseline() …");
-  const t1 = await oracle.refreshBaseline({ gasLimit: 200000n });
-  await t1.wait(1);
-  console.log(`   ✓ ${t1.hash}`);
+  const r1 = await sendWithFallback("refreshBaseline", (w) =>
+    new ethers.Contract(oracleAddr, ORACLE_ABI, w).refreshBaseline({ gasLimit: 200000n }),
+  );
+  // 这台节点刚证明了自己能发交易,后面 poke 优先用它
+  const okUrl = r1.url;
 
   // 等窗口成熟
   console.log(`② 等待 ${(waitMs / 60000).toFixed(1)} 分钟让 TWAP 窗口成熟 …`);
@@ -198,11 +196,13 @@ async function main() {
   // 步骤 2:结算当天并累加
   console.log("③ poke() …");
   try {
-    const t2 = await staking.poke({ gasLimit: 400000n });
-    await t2.wait(1);
-    const [dayAfter, price] = await Promise.all([staking.currentDayIdx(), oracle.snowballUsdPrice()]);
-    console.log(`   ✓ ${t2.hash}`);
-    console.log(`   dayIdx ${dayBefore} → ${dayAfter}  |  结算价 $${ethers.formatUnits(price, 18)}`);
+    const r2 = await sendWithFallback("poke", (w) =>
+      new ethers.Contract(STAKING, STAKING_ABI, w).poke({ gasLimit: 400000n }),
+    );
+    const st2 = new ethers.Contract(STAKING, STAKING_ABI, r2.provider);
+    const oc2 = new ethers.Contract(oracleAddr, ORACLE_ABI, r2.provider);
+    const [dayAfter, price] = await Promise.all([st2.currentDayIdx(), oc2.snowballUsdPrice()]);
+    console.log(`   dayIdx ${dayBefore} → ${dayAfter}  |  结算价 $${ethers.formatUnits(price, 18)}  (发起节点 ${okUrl})`);
     if (dayAfter <= dayBefore) console.log("::warning::dayIdx 未增长,请人工核对。");
   } catch (e) {
     const reason = revertReason(e);

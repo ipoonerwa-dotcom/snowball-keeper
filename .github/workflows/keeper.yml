@@ -43,7 +43,9 @@ jobs:
         env:
           KEEPER_PK: ${{ secrets.KEEPER_PK }}
           SNOWBALL_STAKING: ${{ vars.SNOWBALL_STAKING || secrets.SNOWBALL_STAKING }}
-          RPC_URL: ${{ vars.RPC_URL || 'https://bsc-rpc.publicnode.com' }}
+          # 不给默认值:留空时脚本用自带的候选列表逐个试(见 snowball-poke.mjs)。
+          # 以前这里硬塞 publicnode,等于把候选列表压成单个节点 —— 它一被封就全盘挂掉。
+          RPC_URL: ${{ vars.RPC_URL }}
           WINDOW_WAIT_MS: ${{ vars.WINDOW_WAIT_MS || '' }}
           # 奖励池低于此值(整枚 SNOWBALL)且已有签约本金 → Actions 里报 warning,提醒社区补币。默认 4000。
           LOW_RESERVE_ALERT: ${{ vars.LOW_RESERVE_ALERT || '' }}
