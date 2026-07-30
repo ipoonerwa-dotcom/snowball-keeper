@@ -80,6 +80,15 @@ const OVERRIDE_WAIT = Number(process.env.WINDOW_WAIT_MS || 0);
 // 奖励池低余额告警阈值(整枚 SNOWBALL)。低于它且已有签约本金 → 报警,提醒社区 fundReward 补充,
 // 避免用户领奖时撞上"发完即止"作废。默认 4000(4 万目标的 10%,留足补币时间)。
 const LOW_RESERVE_ALERT = Number(process.env.LOW_RESERVE_ALERT || 4000);
+/**
+ * 逾期告警阈值(小时):距上次结算超过这么久还没成功结算 → 整个 Action 标红。
+ *
+ * 为什么必须有:脚本所有早退路径都是 exit 0 = 绿色。7/29~7/30 连着两天没结算,
+ * Actions 列表里全是绿勾 + 19 秒,看起来风平浪静 —— 只能等社区来问才发现。
+ * 标红之后 GitHub 会自动发邮件,不用再拿社区当监控。
+ * 26 小时 = 正常 24 小时 + 2 小时容差(容忍 GitHub 调度抖动)。
+ */
+const OVERDUE_ALERT_H = Number(process.env.OVERDUE_ALERT_H || 26);
 
 const STAKING_ABI = [
   "function oracle() view returns (address)",
@@ -100,6 +109,11 @@ const ORACLE_ABI = [
 ];
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** 本轮有没有真的把当天结算入账(给最后的逾期判断用) */
+let pokedThisRun = false;
+/** 上次结算时间(秒),读到就填,给最后的逾期判断用 */
+let lastPokeSeen = 0;
 
 // 从 ethers 错误里抠出合约 revert 原因(too soon / window too short / baseline stale …)。
 function revertReason(e) {
@@ -168,6 +182,7 @@ async function main() {
     staking.pokeInterval(),
     staking.currentDayIdx(),
   ]);
+  lastPokeSeen = Number(lastPoke);
   const now = BigInt(Math.floor(Date.now() / 1000));
   const nextOk = lastPoke + interval;
   if (now < nextOk) {
@@ -224,7 +239,8 @@ async function main() {
     const oc2 = new ethers.Contract(oracleAddr, ORACLE_ABI, r2.provider);
     const [dayAfter, price] = await Promise.all([st2.currentDayIdx(), oc2.snowballUsdPrice()]);
     console.log(`   dayIdx ${dayBefore} → ${dayAfter}  |  结算价 $${ethers.formatUnits(price, 18)}  (发起节点 ${okUrl})`);
-    if (dayAfter <= dayBefore) console.log("::warning::dayIdx 未增长,请人工核对。");
+    if (dayAfter > dayBefore) pokedThisRun = true;
+    else console.log("::warning::dayIdx 未增长,请人工核对。");
   } catch (e) {
     const reason = revertReason(e);
     // too soon / window too short / baseline stale：都不是致命,记一笔下轮再来。
@@ -233,7 +249,22 @@ async function main() {
   }
 }
 
-main().catch((e) => {
-  console.error("keeper 异常:", revertReason(e));
-  process.exit(1);
-});
+main()
+  .then(() => {
+    // 本轮没结算成功、而且距上次结算已经超过阈值 → 标红,让 GitHub 发邮件。
+    // 注意不能因为"本轮跳过"就标红:正常日子里一天有 8 个触发点,7 个都该安静跳过。
+    if (pokedThisRun || !lastPokeSeen) return;
+    const hrs = (Date.now() / 1000 - lastPokeSeen) / 3600;
+    if (hrs > OVERDUE_ALERT_H) {
+      const when = new Date(lastPokeSeen * 1000).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
+      console.log(
+        `::error::⚠️ 收益已逾期未结算:上次结算是 ${when},距今 ${hrs.toFixed(1)} 小时(阈值 ${OVERDUE_ALERT_H}h)。` +
+          `本轮也没能补上 —— 请人工检查(常见原因:RPC 全被封 / 热钱包没 gas / 预言机窗口异常)。`,
+      );
+      process.exitCode = 1;
+    }
+  })
+  .catch((e) => {
+    console.error("keeper 异常:", revertReason(e));
+    process.exit(1);
+  });
