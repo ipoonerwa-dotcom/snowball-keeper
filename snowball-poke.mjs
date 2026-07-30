@@ -176,6 +176,27 @@ async function main() {
     return;
   }
 
+  // ── 每个自然日只结算一次(北京时间)──────────────────────────────────
+  //
+  // 【为什么必须有这条】
+  // 合约冷却是 20 小时,比一天短。光靠"冷却到了就 poke"会让结算时间一路往前漂:
+  // 今天 00:07 结算 → 冷却 20:07 解除 → 当天 21:00 那个追赶点就会去 poke →
+  // 明天变 21 点 → 后天 18 点…… 永远稳不在 0 点,社区每天都要问"怎么时间又变了"。
+  //
+  // 加上这条之后:正常日子里凌晨那次做完,当天后面所有追赶点都空转;
+  // 只有"今天还没结算过"时白天的追赶点才动手 —— 既能追上被故障延后的那天,
+  // 又不会把时间往前拽。冷却 20h < 24h 保证了漂移是往 0 点收敛的。
+  //
+  // 用北京时间切日,因为对社区公示的口径就是"每天 0 点后结算"。
+  const bjDay = (epochSec) => Math.floor((Number(epochSec) + 8 * 3600) / 86400); // UTC+8 的日序号
+  if (Number(lastPoke) > 0 && bjDay(lastPoke) === bjDay(now)) {
+    console.log(
+      `今天(北京 ${new Date(Number(now) * 1000).toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai" })})` +
+        ` 已经结算过了(${new Date(Number(lastPoke) * 1000).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })})—— 本轮跳过。`,
+    );
+    return;
+  }
+
   const oracle = new ethers.Contract(oracleAddr, ORACLE_ABI, wallet);
   const minWindow = await oracle.minWindow(); // 秒
   // 等待 = minWindow + 90s 缓冲(既过 minWindow,又远小于 maxWindow=30min)。可被 WINDOW_WAIT_MS 覆盖。
