@@ -129,7 +129,10 @@ function revertReason(e) {
 
 async function main() {
   if (!PK) {
-    console.log("KEEPER_PK 未设 —— 跳过(在仓库 Secrets 里加 KEEPER_PK 才会真正运行)。");
+    // 上线前这里是软跳过(方便先推仓库后配密钥);现在系统已在生产,
+    // 私钥配置丢失 = 结算永久停摆,必须标红出声,不能再绿灯装没事。
+    console.log("::error::KEEPER_PK 未设 —— 结算不会发生。请到仓库 Secrets 补上;若是有意暂停,请到 Actions 页禁用本 workflow。");
+    process.exitCode = 1;
     return;
   }
   if (!/^0x[0-9a-fA-F]{40}$/.test(STAKING)) {
@@ -141,13 +144,18 @@ async function main() {
   const wallet = new ethers.Wallet(PK, provider);
   const staking = new ethers.Contract(STAKING, STAKING_ABI, wallet);
 
-  const [bal, oracleAddr, reserve, principal, snowAddr] = await Promise.all([
+  const [bal, oracleAddr, reserve, principal, snowAddr, lastPokeEarly] = await Promise.all([
     provider.getBalance(wallet.address),
     staking.oracle(),
     staking.rewardReserve(),
     staking.totalPrincipal(),
     staking.snowball(),
+    staking.lastPokeTime(),
   ]);
+  // 逾期判断用的"上次结算时间"必须在【任何早退之前】就位。
+  // 检验时发现的洞:热钱包 gas 归零那条 return 在 lastPokeSeen 赋值之前,
+  // 于是"没 gas → 每轮绿灯跳过 → 永不标红" —— 和 7/29~7/30 静默两天是同一种病。
+  lastPokeSeen = Number(lastPokeEarly);
   // 有效奖励池按【合约代币余额 - 本金】算:社区直接转账的币未 sync 前 rewardReserve 账面偏低,
   // 但合约领取时会自动 sync,所以余额口径才是真实可发量(避免转完账就误报"池空")。
   const snow = new ethers.Contract(snowAddr, ERC20_ABI, provider);
